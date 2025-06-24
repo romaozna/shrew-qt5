@@ -1,4 +1,17 @@
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/provider.h>
+
+// При инициализации программы
+OSSL_PROVIDER* legacy = OSSL_PROVIDER_load(nullptr, "legacy");
+OSSL_PROVIDER* deflt = OSSL_PROVIDER_load(nullptr, "default");
+
+// При завершении программы
+OSSL_PROVIDER_unload(legacy);
+OSSL_PROVIDER_unload(deflt);
+#endif
 /*
  * Copyright (c) 2007
  *      Shrew Soft Inc.  All rights reserved.
@@ -40,6 +53,7 @@
  */
 
 #include "iked.h"
+#include <algorithm>
 
 //
 // opsenssl version compatibility
@@ -59,22 +73,13 @@
 
 void log_openssl_errors()
 {
-	const char * file;
-	int line;
-
-	while( true )
-	{
-		unsigned long code = ERR_get_error_line( &file, &line );
-		if( code == 0 )
-			break;
-
-		char buf[ 1024 ];
-		ERR_error_string_n( code, buf, sizeof( buf ) );
-		iked.log.txt( LLOG_LOUD,
-				"!! : libeay : %s:%i\n"
-				"!! : %s\n",
-				file, line, buf );
-	}
+	char buf[1024];
+    unsigned long code;
+    
+    while ((code = ERR_get_error()) != 0) {
+        ERR_error_string_n(code, buf, sizeof(buf));
+        iked.log.txt(LLOG_LOUD, "!! : libeay : %s\n", buf);
+    }
 }
 
 bool cert_2_bdata( BDATA & cert, X509 * x509 )
@@ -100,9 +105,9 @@ bool bdata_2_cert( X509 ** x509, BDATA & cert )
 	return true;
 }
 
-bool prvkey_rsa_2_bdata( BDATA & prvkey, RSA * rsa )
+bool prvkey_rsa_2_bdata( BDATA & prvkey, const RSA * rsa )
 {
-	int size = i2d_RSAPrivateKey( rsa, NULL );
+	int size = i2d_RSAPrivateKey( const_cast<RSA*>(rsa), NULL );
 	prvkey.size( size );
 
 	unsigned char * prvkey_buff = prvkey.buff();
@@ -123,9 +128,9 @@ bool bdata_2_prvkey_rsa( RSA ** rsa, BDATA & prvkey )
 	return true;
 }
 
-bool pubkey_rsa_2_bdata( BDATA & pubkey, RSA * rsa )
+bool pubkey_rsa_2_bdata( BDATA & pubkey, const RSA * rsa )
 {
-	int size = i2d_RSAPublicKey( rsa, NULL );
+	int size = i2d_RSAPublicKey( const_cast<RSA*>(rsa), NULL );
 	pubkey.size( size );
 
 	unsigned char * pubkey_buff = pubkey.buff();
@@ -150,17 +155,13 @@ bool bdata_2_pubkey_rsa( RSA ** rsa, BDATA & pubkey )
 
 int password_cb( char * buf, int size, int rwflag, void * userdata )
 {
-	BDATA * fpass = ( BDATA * ) userdata;
-	if( !fpass->size() )
-		return 0;
+	BDATA *fpass = static_cast<BDATA*>(userdata);
+    if (!fpass || fpass->size() == 0)
+        return 0;
 
-	memset( buf, 0, size );
-	if( size > fpass->size() )
-		size = fpass->size();
-
-	memcpy( buf, fpass->buff(), size );
-
-	return size;
+    int len = std::min(size, static_cast<int>(fpass->size()));
+    memcpy(buf, fpass->buff(), len);
+    return len;
 }
 
 bool cert_load_pem( BDATA & cert, FILE * fp, bool ca, BDATA & pass )
@@ -177,48 +178,62 @@ bool cert_load_pem( BDATA & cert, FILE * fp, bool ca, BDATA & pass )
 	return converted;
 }
 
-bool cert_load_p12( BDATA & cert, FILE * fp, bool ca, BDATA & pass )
+bool cert_load_p12(BDATA &cert, FILE *fp, bool ca, BDATA &pass)
 {
-	// PKCS12 required a null terminated password
-	BDATA nullpass;
-	nullpass.set( pass );
-	nullpass.add( "", 1 );
+    // PKCS12 требует нуль-терминированный пароль
+    BDATA nullpass;
+    nullpass.set(pass);
+    nullpass.add("", 1);
 
-	fseek( fp, 0, SEEK_SET );
+    fseek(fp, 0, SEEK_SET);
 
-	PKCS12 * p12 = d2i_PKCS12_fp( fp, NULL );
-	if( p12 == NULL )
-		return false;
+    PKCS12 *p12 = d2i_PKCS12_fp(fp, NULL);
+    if (!p12)
+        return false;
 
-	X509 * x509 = NULL;
+    X509 *x509 = NULL;
+    EVP_PKEY *pkey = NULL;
+    STACK_OF(X509) *stack = NULL;
+    int ret = 0;
 
-	if( ca )
-	{
-		STACK_OF( X509 ) * stack = NULL;
+    // Используем временные переменные для безопасности
+    char *pass_str = nullpass.text();
+    
+    if (ca)
+    {
+        // Загружаем только CA-сертификаты
+        ret = PKCS12_parse(p12, pass_str, NULL, NULL, &stack);
+        
+        if (ret && stack && sk_X509_num(stack) > 0)
+        {
+            // Берем первый сертификат из стека
+            x509 = sk_X509_value(stack, 0);
+            X509_up_ref(x509); // Увеличиваем счетчик ссылок
+        }
+    }
+    else
+    {
+        // Загружаем пользовательский сертификат
+        ret = PKCS12_parse(p12, pass_str, &pkey, &x509, NULL);
+    }
 
-		if( PKCS12_parse( p12, nullpass.text(), NULL, NULL, &stack ) )
-		{
-			if( stack != NULL )
-			{
-				if( sk_X509_value( stack, 0 ) != NULL )
-					x509 = sk_X509_value( stack, 0 );
+    PKCS12_free(p12);
+    
+    if (!ret || !x509)
+    {
+        if (stack) sk_X509_pop_free(stack, X509_free);
+        if (pkey) EVP_PKEY_free(pkey);
+        return false;
+    }
 
-				sk_X509_free( stack );
-			}
-		}
-	}
-	else
-		PKCS12_parse( p12, nullpass.text(), NULL, &x509, NULL );
+    bool converted = cert_2_bdata(cert, x509);
+    
+    // Освобождаем ресурсы
+    X509_free(x509);
+    if (pkey) EVP_PKEY_free(pkey);
+    if (stack) sk_X509_pop_free(stack, X509_free);
 
-	PKCS12_free( p12 );
-
-	if( x509 == NULL )
-		return false;
-
-	bool converted = cert_2_bdata( cert, x509 );
-	X509_free( x509 );
-
-	return converted;
+    return converted;
 }
 
 long _IKED::cert_load( BDATA & cert, char * fpath, bool ca, BDATA & pass )
@@ -858,8 +873,10 @@ bool prvkey_rsa_load_pem( BDATA & prvkey, FILE * fp, BDATA & pass )
 	if( evp_pkey == NULL )
 		return false;
 
-	bool converted = prvkey_rsa_2_bdata( prvkey, EVP_PKEY_get0_RSA( evp_pkey ) );
-	EVP_PKEY_free( evp_pkey );
+    RSA* rsa = EVP_PKEY_get1_RSA(evp_pkey);
+    bool converted = prvkey_rsa_2_bdata(prvkey, rsa);
+    RSA_free(rsa);	
+    EVP_PKEY_free( evp_pkey );
 
 	return converted;
 }
@@ -884,7 +901,7 @@ bool prvkey_rsa_load_p12( BDATA & prvkey, FILE * fp, BDATA & pass )
 	if( evp_pkey == NULL )
 		return false;
 
-	bool converted = prvkey_rsa_2_bdata( prvkey, EVP_PKEY_get0_RSA( evp_pkey ) );
+	bool converted = prvkey_rsa_2_bdata( prvkey, EVP_PKEY_get1_RSA( evp_pkey ) );
 	EVP_PKEY_free( evp_pkey );
 
 	return converted;
@@ -940,7 +957,7 @@ bool prvkey_rsa_load_pem( BDATA & prvkey, BDATA & input, BDATA & pass )
 	if( evp_pkey == NULL )
 		return false;
 
-	bool converted = prvkey_rsa_2_bdata( prvkey, EVP_PKEY_get0_RSA( evp_pkey ) );
+	bool converted = prvkey_rsa_2_bdata( prvkey, EVP_PKEY_get1_RSA( evp_pkey ) );
 	EVP_PKEY_free( evp_pkey );
 
 	return converted;
@@ -977,7 +994,7 @@ bool prvkey_rsa_load_p12( BDATA & prvkey, BDATA & input, BDATA & pass )
 	if( evp_pkey == NULL )
 		return false;
 
-	bool converted = prvkey_rsa_2_bdata( prvkey, EVP_PKEY_get0_RSA( evp_pkey ) );
+	bool converted = prvkey_rsa_2_bdata( prvkey, EVP_PKEY_get1_RSA( evp_pkey ) );
 	EVP_PKEY_free( evp_pkey );
 
 	return converted;
@@ -1011,7 +1028,7 @@ bool _IKED::pubkey_rsa_read( BDATA & cert, BDATA & pubkey )
 	if( evp_pkey == NULL )
 		return false;
 
-	bool result = pubkey_rsa_2_bdata( pubkey, EVP_PKEY_get0_RSA( evp_pkey ) );
+	bool result = pubkey_rsa_2_bdata( pubkey, EVP_PKEY_get1_RSA( evp_pkey ) );
 
 	EVP_PKEY_free( evp_pkey );
 
@@ -1020,52 +1037,92 @@ bool _IKED::pubkey_rsa_read( BDATA & cert, BDATA & pubkey )
 
 bool _IKED::prvkey_rsa_encrypt( BDATA & prvkey, BDATA & hash, BDATA & sign )
 {
-	RSA * rsa;
-	if( !bdata_2_prvkey_rsa( &rsa, prvkey ) )
-		return false;
+	EVP_PKEY_CTX* ctx = nullptr;
+    EVP_PKEY* pkey = nullptr;
+    size_t outlen = 0;
+    bool result = false;
 
-	int size = RSA_size( rsa );
-	sign.size( size );
+    // Загрузка ключа
+    RSA* rsa;
+    if (!bdata_2_prvkey_rsa(&rsa, prvkey))
+        return false;
 
-	size = RSA_private_encrypt(
-				( int ) hash.size(),
-				hash.buff(),
-				sign.buff(),
-				rsa,
-				RSA_PKCS1_PADDING );
+    pkey = EVP_PKEY_new();
+    if (!pkey || EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        RSA_free(rsa);
+        goto cleanup;
+    }
 
-	if( size == -1 )
-		return false;
+    // Инициализация контекста
+    ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    if (!ctx || EVP_PKEY_sign_init(ctx) <= 0)
+        goto cleanup;
 
-	RSA_free( rsa );
+    // Установка PKCS1 padding
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) <= 0)
+        goto cleanup;
 
-	sign.size( size );
+    // Определение размера подписи
+    if (EVP_PKEY_sign(ctx, nullptr, &outlen, hash.buff(), hash.size()) <= 0)
+        goto cleanup;
 
-	return true;
+    // Выделение памяти и создание подписи
+    sign.size(outlen);
+    if (EVP_PKEY_sign(ctx, sign.buff(), &outlen, hash.buff(), hash.size()) <= 0)
+        goto cleanup;
+
+    sign.size(outlen);
+    result = true;
+
+cleanup:
+    if (ctx) EVP_PKEY_CTX_free(ctx);
+    if (pkey) EVP_PKEY_free(pkey); // Освобождает и RSA тоже
+    return result;
 }
 
 bool _IKED::pubkey_rsa_decrypt( BDATA & pubkey, BDATA & sign, BDATA & hash )
 {
-	RSA * rsa;
-	if( !bdata_2_pubkey_rsa( &rsa, pubkey ) )
-		return false;
+	EVP_PKEY_CTX* ctx = nullptr;
+    EVP_PKEY* pkey = nullptr;
+    size_t outlen = 0;
+    bool result = false;
 
-	int size = RSA_size( rsa );
-	hash.size( size );
+    // Загрузка ключа
+    RSA* rsa;
+    if (!bdata_2_pubkey_rsa(&rsa, pubkey))
+        return false;
 
-	size = RSA_public_decrypt(
-				( int ) sign.size(),
-				sign.buff(),
-				hash.buff(),
-				rsa,
-				RSA_PKCS1_PADDING );
+    pkey = EVP_PKEY_new();
+    if (!pkey || EVP_PKEY_assign_RSA(pkey, rsa) != 1) {
+        RSA_free(rsa);
+        goto cleanup;
+    }
 
-	if( size == -1 )
-		return false;
+    // Инициализация контекста
+    ctx = EVP_PKEY_CTX_new(pkey, nullptr);
+    if (!ctx || EVP_PKEY_verify_recover_init(ctx) <= 0)
+        goto cleanup;
 
-	RSA_free( rsa );
+    // Установка PKCS1 padding
+    if (EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PADDING) <= 0)
+        goto cleanup;
 
-	hash.size( size );
+    // Определение размера данных
+    if (EVP_PKEY_verify_recover(ctx, nullptr, &outlen, sign.buff(), sign.size()) <= 0)
+        goto cleanup;
 
-	return true;
+    // Выделение памяти и восстановление данных
+    hash.size(outlen);
+    if (EVP_PKEY_verify_recover(ctx, hash.buff(), &outlen, sign.buff(), sign.size()) <= 0)
+        goto cleanup;
+
+    hash.size(outlen);
+    result = true;
+
+cleanup:
+    if (ctx) EVP_PKEY_CTX_free(ctx);
+    if (pkey) EVP_PKEY_free(pkey);
+    return result;
 }
+
+#pragma GCC diagnostic pop
